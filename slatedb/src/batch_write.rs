@@ -41,9 +41,14 @@ use bytes::Bytes;
 use crate::config::WriteOptions;
 use crate::dispatcher::MessageHandler;
 use crate::mem_table::KVTable;
-use crate::types::RowEntry;
+use crate::oracle::Oracle;
 use crate::utils::WatchableOnceCellReader;
-use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
+use crate::{
+    batch::{PreparedWriteEntry, WriteBatch},
+    db::DbInner,
+    db::WriteHandle,
+    error::SlateDBError,
+};
 use slatedb_common::clock::SystemClock;
 
 pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
@@ -161,8 +166,8 @@ impl DbInner {
 
         // Count batch-local merge folding on the flush path so DB-side merge
         // resolution uses one metric for both write batches and memtable flushes.
-        let (entries, touched_segments) = batch
-            .extract_entries(
+        let (prepared_entries, touched_segments) = batch
+            .extract_prepared_entries(
                 commit_seq,
                 now,
                 self.settings.default_ttl,
@@ -184,15 +189,19 @@ impl DbInner {
             // would violate the guarantee that batches are written atomically. We do
             // this by appending the entire entry batch in a single call to the WAL buffer,
             // which holds a write lock during the append.
-            let wal_watcher = self.wal_buffer.append(&entries)?;
+            let wal_entries = prepared_entries
+                .iter()
+                .map(|entry| entry.row.clone())
+                .collect::<Vec<_>>();
+            let wal_watcher = self.wal_buffer.append(&wal_entries)?;
             self.wal_buffer.maybe_trigger_flush()?;
             // TODO: handle sync here, if sync is enabled, we can call `flush` here. let's put this
             // in another Pull Request.
-            self.write_entries_to_memtable(entries, touched_segments);
+            self.write_entries_to_memtable(prepared_entries, touched_segments);
             wal_watcher
         } else {
             // if WAL is disabled, we just write the entries to memtable.
-            self.write_entries_to_memtable(entries, touched_segments)
+            self.write_entries_to_memtable(prepared_entries, touched_segments)
         };
 
         // update the last_applied_seq to wal buffer. if a chunk of WAL entries are applied to the memtable
@@ -289,14 +298,38 @@ impl DbInner {
     /// `touched_segments` is empty and recording is a no-op.
     fn write_entries_to_memtable(
         &self,
-        entries: Vec<RowEntry>,
+        entries: Vec<PreparedWriteEntry>,
         touched_segments: BTreeSet<Bytes>,
     ) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
+        let min_retention_seq = self.memtable_dedupe_retention_seq();
         let guard = self.state.read();
         let memtable = guard.memtable();
         memtable.record_touched_segments(touched_segments);
-        entries.into_iter().for_each(|entry| memtable.put(entry));
+        for PreparedWriteEntry {
+            row,
+            memtable_dedupe,
+        } in entries
+        {
+            let key = row.key.clone();
+            memtable.put(row);
+
+            if memtable_dedupe.enabled() {
+                memtable.table().dedupe_old_entries(&key, min_retention_seq);
+            }
+        }
         memtable.table().durable_watcher()
+    }
+
+    fn memtable_dedupe_retention_seq(&self) -> Option<u64> {
+        let durable_seq = self.oracle.last_remote_persisted_seq();
+        [
+            Some(durable_seq),
+            self.snapshot_manager.min_active_seq(),
+            self.txn_manager.min_active_seq(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn record_memtable_sequence(&self, seq: u64) {

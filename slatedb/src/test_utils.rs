@@ -6,6 +6,7 @@ use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
 use crate::format::row::SstRowCodecV0;
 use crate::iter::{IterationOrder, RowEntryIterator};
+use crate::mem_table::KVTable;
 use crate::tablestore::TableStore;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 use async_trait::async_trait;
@@ -249,6 +250,17 @@ where
         Included(b) | Excluded(b) => Some(b),
         Unbounded => None,
     }
+}
+
+pub(crate) fn seqs_for_key(table: &KVTable, key: &[u8]) -> Vec<u64> {
+    let mut iter = table.range_ascending(BytesRange::from(
+        Bytes::copy_from_slice(key)..=Bytes::copy_from_slice(key),
+    ));
+    let mut seqs = Vec::new();
+    while let Some(row) = iter.next_sync() {
+        seqs.push(row.seq);
+    }
+    seqs
 }
 
 pub(crate) async fn seed_database(

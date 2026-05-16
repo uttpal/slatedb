@@ -471,6 +471,22 @@ impl Default for WriteOptions {
     }
 }
 
+/// Optional active-memtable cleanup policy for put operations.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum MemtableDedupe {
+    /// Keep all active mutable memtable versions for the written key.
+    #[default]
+    Disabled,
+    /// Remove at most one older active mutable memtable version after the put.
+    DedupOldVersion,
+}
+
+impl MemtableDedupe {
+    pub(crate) fn enabled(self) -> bool {
+        matches!(self, Self::DedupOldVersion)
+    }
+}
+
 /// Configuration for client put operations. `PutOptions` is supplied for each
 /// row inserted. This differs from [`WriteOptions`] in that a write may encompass
 /// multiple puts (such as the case with batched writes)
@@ -481,6 +497,15 @@ pub struct PutOptions {
     ///
     /// Default: the TTL configured in DbOptions when opening a SlateDB session
     pub ttl: Ttl,
+
+    /// Removes at most one older version of the written key from the active
+    /// mutable memtable after this put is inserted. Active snapshot and
+    /// transaction boundaries are preserved. In-progress scans and ordinary
+    /// non-snapshot gets are not protected, so opted-in writes can remove
+    /// active-memtable entries those readers would otherwise observe.
+    ///
+    /// Default: disabled.
+    pub memtable_dedupe: MemtableDedupe,
 }
 
 impl PutOptions {
@@ -1623,6 +1648,7 @@ object_store_cache_options:
         // given
         let opts = PutOptions {
             ttl: Ttl::ExpireAt(12345),
+            ..Default::default()
         };
 
         // when
@@ -1637,6 +1663,7 @@ object_store_cache_options:
         // given
         let opts = PutOptions {
             ttl: Ttl::ExpireAt(12345),
+            ..Default::default()
         };
 
         // when
@@ -1651,6 +1678,7 @@ object_store_cache_options:
         // given
         let opts = PutOptions {
             ttl: Ttl::ExpireAt(50),
+            ..Default::default()
         };
 
         // when
@@ -1679,6 +1707,7 @@ object_store_cache_options:
         // given: same ExpireAt value used at different times
         let opts = PutOptions {
             ttl: Ttl::ExpireAt(99999),
+            ..Default::default()
         };
 
         // when

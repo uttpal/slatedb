@@ -293,6 +293,7 @@ impl From<PutOptions> for slatedb::config::PutOptions {
     fn from(value: PutOptions) -> Self {
         slatedb::config::PutOptions {
             ttl: value.ttl.into(),
+            memtable_dedupe: slatedb::config::MemtableDedupe::Disabled,
         }
     }
 }

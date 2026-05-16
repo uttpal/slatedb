@@ -3267,6 +3267,7 @@ mod tests {
             value,
             &PutOptions {
                 ttl: Ttl::ExpireAt(10),
+                ..Default::default()
             },
             &WriteOptions {
                 await_durable: false,
@@ -3283,6 +3284,7 @@ mod tests {
             value,
             &PutOptions {
                 ttl: Ttl::ExpireAt(i64::MAX),
+                ..Default::default()
             },
             &WriteOptions {
                 await_durable: false,
@@ -3299,7 +3301,10 @@ mod tests {
         db.put_with_options(
             &[3; 16],
             value,
-            &PutOptions { ttl: Ttl::NoExpiry },
+            &PutOptions {
+                ttl: Ttl::NoExpiry,
+                ..Default::default()
+            },
             &WriteOptions {
                 await_durable: false,
                 ..Default::default()
@@ -3381,6 +3386,7 @@ mod tests {
             value,
             &PutOptions {
                 ttl: Ttl::ExpireAfter(10),
+                ..Default::default()
             },
             &WriteOptions {
                 await_durable: false,
@@ -3395,7 +3401,10 @@ mod tests {
         db.put_with_options(
             &[2; 16],
             value,
-            &PutOptions { ttl: Ttl::Default },
+            &PutOptions {
+                ttl: Ttl::Default,
+                ..Default::default()
+            },
             &WriteOptions {
                 await_durable: false,
                 ..Default::default()
@@ -3411,7 +3420,10 @@ mod tests {
         db.put_with_options(
             &[3; 16],
             value,
-            &PutOptions { ttl: Ttl::NoExpiry },
+            &PutOptions {
+                ttl: Ttl::NoExpiry,
+                ..Default::default()
+            },
             &WriteOptions {
                 await_durable: false,
                 ..Default::default()
@@ -3428,6 +3440,7 @@ mod tests {
             value,
             &PutOptions {
                 ttl: Ttl::ExpireAfter(80),
+                ..Default::default()
             },
             &WriteOptions {
                 await_durable: false,

@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
-use crate::types::RowEntry;
+use crate::types::{RowEntry, ValueDeletable};
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
 
 /// Memtable may contains multiple versions of a single user key, with a monotonically increasing sequence number.
@@ -540,6 +540,72 @@ impl KVTable {
         }
     }
 
+    /// Removes at most one older version of the given key from the memtable.
+    ///
+    /// This is an active-memtable footprint optimization that performs bounded work:
+    /// 1. Find the "retained" row: the newest version of the key that must be kept
+    ///    to satisfy snapshot/transaction isolation (defined by `min_retention_seq`).
+    /// 2. Inspect the "candidate" row: the next physically older version of the same key.
+    /// 3. Remove the candidate if it is safe to do so.
+    pub(crate) fn dedupe_old_entries(&self, key: &Bytes, min_retention_seq: Option<u64>) {
+        let seek_seq = min_retention_seq.unwrap_or(u64::MAX);
+        let seek_key = SequencedKey::new(key.clone(), seek_seq);
+
+        // Find the first entry <= seek_seq. This is our "retained" boundary row.
+        let Some(retained_entry) = self.map.lower_bound(Bound::Included(&seek_key)) else {
+            return;
+        };
+        if retained_entry.key().user_key != *key {
+            return;
+        }
+
+        let retained_seq = retained_entry.key().seq;
+
+        // If the retained row is a merge operand, we cannot remove the candidate
+        // because it might be the base value required to resolve the merge.
+        if matches!(retained_entry.value().value, ValueDeletable::Merge(_)) {
+            return;
+        }
+
+        // The candidate is the next physical entry in the skiplist.
+        // Since SequencedKey is ordered by seq DESC, .next() is the next older version.
+        let Some(candidate_entry) = retained_entry.next() else {
+            return;
+        };
+        if candidate_entry.key().user_key != *key {
+            return;
+        }
+
+        let candidate_key = candidate_entry.key().clone();
+        let candidate_seq = candidate_key.seq;
+
+        // Do not remove merge operands; let compaction handle merge-chain deduplication.
+        if matches!(candidate_entry.value().value, ValueDeletable::Merge(_)) {
+            return;
+        }
+
+        // Release the skiplist entry handles before calling remove to avoid potential
+        // deadlocks or holding references longer than necessary.
+        drop(retained_entry);
+        drop(candidate_entry);
+
+        // Invariants check: the candidate must be strictly older than the retained row.
+        if candidate_seq >= retained_seq {
+            return;
+        }
+
+        // `first_seq` is a cheap monotonic metadata hint. Dedupe avoids removing
+        // the table-wide oldest row rather than recomputing it on this hot path.
+        if candidate_seq == self.first_seq.load(Ordering::SeqCst) {
+            return;
+        }
+
+        if let Some(removed) = self.map.remove(&candidate_key) {
+            self.entries_size_in_bytes
+                .fetch_sub(removed.value().estimated_size(), Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
         self.durable.reader()
     }
@@ -566,7 +632,7 @@ mod tests {
     use crate::bytes_range::BytesRange;
     use crate::merge_iterator::MergeIterator;
     use crate::proptest_util::{arbitrary, sample};
-    use crate::test_utils::assert_iterator;
+    use crate::test_utils::{assert_iterator, seqs_for_key};
     use crate::{proptest_util, test_utils};
     use rstest::rstest;
     use tokio::runtime::Runtime;
@@ -974,5 +1040,143 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[test]
+    fn dedupe_old_entries_removes_one_entry_older_than_boundary() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", b"v5", 5));
+        table.put(RowEntry::new_value(b"k", b"v4", 4));
+        table.put(RowEntry::new_value(b"k", b"v3", 3));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), Some(5));
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![5, 3]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_keeps_snapshot_boundary_row() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", b"v10", 10));
+        table.put(RowEntry::new_value(b"k", b"v7", 7));
+        table.put(RowEntry::new_value(b"k", b"v3", 3));
+        table.put(RowEntry::new_value(b"k", b"v1", 1));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), Some(7));
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![10, 7, 1]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_without_boundary_keeps_newest() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", b"v3", 3));
+        table.put(RowEntry::new_value(b"k", b"v2", 2));
+        table.put(RowEntry::new_value(b"k", b"v1", 1));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![3, 1]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_does_not_remove_other_keys() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"a", b"v", 10));
+        table.put(RowEntry::new_value(b"k", b"v", 10));
+        table.put(RowEntry::new_value(b"z", b"v", 10));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(seqs_for_key(table.table(), b"a"), vec![10]);
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![10]);
+        assert_eq!(seqs_for_key(table.table(), b"z"), vec![10]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_removes_one_older_tombstone() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", b"v3", 3));
+        table.put(RowEntry::new_tombstone(b"k", 2));
+        table.put(RowEntry::new_value(b"k", b"v1", 1));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![3, 1]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_skips_when_retained_row_is_merge_operand() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_merge(b"k", b"m", 3));
+        table.put(RowEntry::new_value(b"k", b"base", 2));
+        table.put(RowEntry::new_value(b"k", b"old", 1));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_skips_merge_operand_candidate() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", b"v3", 3));
+        table.put(RowEntry::new_merge(b"k", b"m", 2));
+        table.put(RowEntry::new_value(b"k", b"v1", 1));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_skips_current_first_seq() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", b"v2", 2));
+        table.put(RowEntry::new_value(b"k", b"v1", 1));
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![2, 1]);
+    }
+
+    #[test]
+    fn dedupe_old_entries_updates_entries_size_in_bytes() {
+        let table = WritableKVTable::new();
+        let removed = RowEntry::new_value(b"k", b"remove", 2);
+        let removed_size = removed.estimated_size();
+        table.put(RowEntry::new_value(b"k", b"keep", 3));
+        table.put(removed);
+        table.put(RowEntry::new_value(b"k", b"old", 1));
+        let before = table.metadata().entries_size_in_bytes;
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(
+            table.metadata().entries_size_in_bytes,
+            before - removed_size
+        );
+    }
+
+    #[test]
+    fn dedupe_old_entries_removes_at_most_one_entry() {
+        let table = WritableKVTable::new();
+        for seq in 1..=5 {
+            table.put(RowEntry::new_value(b"k", b"v", seq));
+        }
+
+        table
+            .table()
+            .dedupe_old_entries(&Bytes::from_static(b"k"), None);
+        assert_eq!(seqs_for_key(table.table(), b"k"), vec![5, 3, 2, 1]);
     }
 }

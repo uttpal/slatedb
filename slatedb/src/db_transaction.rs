@@ -1866,6 +1866,7 @@ mod tests {
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let put_opts = PutOptions {
             ttl: crate::config::Ttl::ExpireAfter(1000),
+            ..Default::default()
         };
         txn.put_with_options(b"key2", b"value2", &put_opts).unwrap();
         let handle = txn

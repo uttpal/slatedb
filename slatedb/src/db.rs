@@ -2066,8 +2066,8 @@ mod tests {
     use crate::config::DurabilityLevel::{Memory, Remote};
     use crate::config::{
         CheckpointOptions, CompactorOptions, GarbageCollectorDirectoryOptions,
-        GarbageCollectorOptions, ObjectStoreCacheOptions, PutOptions, ScanOptions, Settings, Ttl,
-        WriteOptions,
+        GarbageCollectorOptions, MemtableDedupe, ObjectStoreCacheOptions, PutOptions, ScanOptions,
+        Settings, Ttl, WriteOptions,
     };
     use crate::db::builder::GarbageCollectorBuilder;
     use crate::db_stats::IMMUTABLE_MEMTABLE_FLUSHES;
@@ -2114,6 +2114,21 @@ mod tests {
     use std::time::Duration;
     use tokio::runtime::Runtime;
     use tracing::info;
+
+    fn active_memtable_seqs_for_key(db: &Db, key: &[u8]) -> Vec<u64> {
+        let guard = db.inner.state.read();
+        let table = guard.memtable().table().clone();
+        drop(guard);
+
+        test_utils::seqs_for_key(&table, key)
+    }
+
+    fn dedupe_put_options() -> PutOptions {
+        PutOptions {
+            memtable_dedupe: MemtableDedupe::DedupOldVersion,
+            ..Default::default()
+        }
+    }
 
     fn object_store_labels(
         component: &'static str,
@@ -2222,6 +2237,194 @@ mod tests {
         kv_store.delete(key).await.unwrap();
         assert_eq!(None, kv_store.get(key).await.unwrap());
         kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_with_memtable_dedupe_removes_one_active_memtable_version() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_put_with_memtable_dedupe", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        db.put_with_options(
+            b"k",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.put_with_options(
+            b"k",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.inner.oracle.set_durable_seq_unsafe(3);
+        db.put_with_options(
+            b"k",
+            b"v3",
+            &dedupe_put_options(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(active_memtable_seqs_for_key(&db, b"k"), vec![3, 1]);
+        assert_eq!(db.get(b"k").await.unwrap(), Some(Bytes::from_static(b"v3")));
+    }
+
+    #[tokio::test]
+    async fn put_without_memtable_dedupe_preserves_existing_versions() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_put_without_memtable_dedupe", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        db.inner.oracle.set_durable_seq_unsafe(3);
+        for value in [b"v1".as_slice(), b"v2".as_slice(), b"v3".as_slice()] {
+            db.put_with_options(
+                b"k",
+                value,
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(active_memtable_seqs_for_key(&db, b"k"), vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn write_batch_preserves_per_put_dedupe_option() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_write_batch_preserves_put_dedupe", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        db.put_with_options(
+            b"dedupe",
+            b"old1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.put_with_options(
+            b"dedupe",
+            b"old2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.put_with_options(
+            b"default",
+            b"old1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.put_with_options(
+            b"default",
+            b"old2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.inner.oracle.set_durable_seq_unsafe(5);
+        let mut batch = WriteBatch::new();
+        batch.put_with_options(b"dedupe", b"new", &dedupe_put_options());
+        batch.put(b"default", b"new");
+        db.write_with_options(
+            batch,
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(active_memtable_seqs_for_key(&db, b"dedupe"), vec![5, 1]);
+        assert_eq!(active_memtable_seqs_for_key(&db, b"default"), vec![5, 4, 3]);
+    }
+
+    #[tokio::test]
+    async fn dedupe_preserves_active_snapshot_boundary() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_dedupe_preserves_snapshot_boundary", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        db.put_with_options(
+            b"k",
+            b"snapshot",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let snapshot = db.snapshot().await.unwrap();
+        db.inner.oracle.set_durable_seq_unsafe(2);
+        db.put_with_options(
+            b"k",
+            b"newer",
+            &dedupe_put_options(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot.get(b"k").await.unwrap(),
+            Some(Bytes::from_static(b"snapshot"))
+        );
+        assert_eq!(active_memtable_seqs_for_key(&db, b"k"), vec![2, 1]);
     }
 
     #[tokio::test]
@@ -3276,6 +3479,7 @@ mod tests {
                 val.as_bytes(),
                 &PutOptions {
                     ttl: Default::default(),
+                    ..Default::default()
                 },
                 &WriteOptions {
                     await_durable: false,
@@ -7399,6 +7603,7 @@ mod tests {
         clock.set(200);
         let put_opts = PutOptions {
             ttl: Ttl::ExpireAfter(1000),
+            ..Default::default()
         };
         let handle = db
             .put_with_options(
@@ -8429,6 +8634,7 @@ mod tests {
             value,
             &PutOptions {
                 ttl: Ttl::ExpireAfter(50),
+                ..Default::default()
             },
             &WriteOptions {
                 await_durable: false,
@@ -8462,6 +8668,7 @@ mod tests {
 
         let put_opts = PutOptions {
             ttl: Ttl::ExpireAfter(50),
+            ..Default::default()
         };
         let write_opts = WriteOptions {
             await_durable: false,
@@ -8538,6 +8745,7 @@ mod tests {
             b"value1",
             &PutOptions {
                 ttl: Ttl::ExpireAt(500),
+                ..Default::default()
             },
             &WriteOptions {
                 await_durable: false,
@@ -8553,6 +8761,7 @@ mod tests {
             b"value2",
             &PutOptions {
                 ttl: Ttl::ExpireAt(500),
+                ..Default::default()
             },
             &WriteOptions {
                 await_durable: false,

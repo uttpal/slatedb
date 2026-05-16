@@ -4,7 +4,7 @@
 //! collection of write operations (puts and/or deletes) that are applied
 //! atomically to the database.
 
-use crate::config::{MergeOptions, PutOptions};
+use crate::config::{MemtableDedupe, MergeOptions, PutOptions};
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::mem_table::{KVTableInternalKeyRange, SequencedKey};
@@ -74,6 +74,12 @@ pub(crate) enum WriteOp {
     Merge(Bytes, Bytes, MergeOptions),
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedWriteEntry {
+    pub(crate) row: RowEntry,
+    pub(crate) memtable_dedupe: MemtableDedupe,
+}
+
 impl std::fmt::Debug for WriteOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn trunc(bytes: &Bytes) -> String {
@@ -104,6 +110,21 @@ impl std::fmt::Debug for WriteOp {
 }
 
 impl WriteOp {
+    fn memtable_dedupe(&self) -> MemtableDedupe {
+        match self {
+            WriteOp::Put(_, _, options) => options.memtable_dedupe,
+            WriteOp::Delete(_) | WriteOp::Merge(_, _, _) => MemtableDedupe::Disabled,
+        }
+    }
+
+    pub(crate) fn expire_ts_from(&self, default_ttl: Option<u64>, now: i64) -> Option<i64> {
+        match self {
+            WriteOp::Put(_, _, opts) => opts.expire_ts_from(default_ttl, now),
+            WriteOp::Merge(_, _, opts) => opts.expire_ts_from(default_ttl, now),
+            WriteOp::Delete(_) => None,
+        }
+    }
+
     /// Convert WriteOp to RowEntry for queries
     pub(crate) fn to_row_entry(
         &self,
@@ -325,8 +346,8 @@ impl WriteBatch {
         self.ops.keys().map(|key| key.user_key.clone()).collect()
     }
 
-    /// Converts a WriteBatch into a vector of RowEntry objects with
-    /// seq and timestamp set, applying the merge operator to any
+    /// Converts a WriteBatch into prepared row entries with seq, timestamp,
+    /// and per-entry write options set, applying the merge operator to any
     /// mergeable entries.
     ///
     /// When `extractor` is `Some`, the same iteration also derives
@@ -336,16 +357,30 @@ impl WriteBatch {
     /// or absent prefix for any key.
     ///
     /// When `extractor` is `None`, the returned prefix set is empty.
-    pub(crate) async fn extract_entries(
+    pub(crate) async fn extract_prepared_entries(
         &self,
         seq: u64,
         now: i64,
         default_ttl: Option<u64>,
         merger: Option<MergeOperatorType>,
         extractor: Option<&dyn PrefixExtractor>,
-    ) -> Result<(Vec<RowEntry>, BTreeSet<Bytes>), SlateDBError> {
+    ) -> Result<(Vec<PreparedWriteEntry>, BTreeSet<Bytes>), SlateDBError> {
         if merger.is_none() && self.has_merge_ops() {
             return Err(SlateDBError::MergeOperatorMissing);
+        }
+
+        let mut touched_segments: BTreeSet<Bytes> = BTreeSet::new();
+        if !self.has_merge_ops() {
+            let mut entries = Vec::new();
+            for op in self.ops.values() {
+                let row = op.to_row_entry(seq, Some(now), op.expire_ts_from(default_ttl, now));
+                Self::record_touched_segment(&mut touched_segments, extractor, &row.key)?;
+                entries.push(PreparedWriteEntry {
+                    row,
+                    memtable_dedupe: op.memtable_dedupe(),
+                });
+            }
+            return Ok((entries, touched_segments));
         }
 
         let mut it: Box<dyn RowEntryIterator> = Box::new(WriteBatchIterator::new_with_seq_and_ttl(
@@ -366,23 +401,32 @@ impl WriteBatch {
         }
 
         let mut entries = Vec::new();
-        let mut touched_segments: BTreeSet<Bytes> = BTreeSet::new();
         while let Some(entry) = it.next().await? {
-            if let Some(ext) = extractor {
-                match ext.prefix_len(&PrefixTarget::Point(entry.key.clone())) {
-                    Some(0) | None => {
-                        return Err(SlateDBError::EmptySegmentPrefix {
-                            key: entry.key.clone(),
-                        });
-                    }
-                    Some(n) => {
-                        touched_segments.insert(entry.key.slice(0..n));
-                    }
-                }
-            }
-            entries.push(entry);
+            Self::record_touched_segment(&mut touched_segments, extractor, &entry.key)?;
+            entries.push(PreparedWriteEntry {
+                row: entry,
+                memtable_dedupe: MemtableDedupe::Disabled,
+            });
         }
         Ok((entries, touched_segments))
+    }
+
+    fn record_touched_segment(
+        touched_segments: &mut BTreeSet<Bytes>,
+        extractor: Option<&dyn PrefixExtractor>,
+        key: &Bytes,
+    ) -> Result<(), SlateDBError> {
+        if let Some(ext) = extractor {
+            match ext.prefix_len(&PrefixTarget::Point(key.clone())) {
+                Some(0) | None => {
+                    return Err(SlateDBError::EmptySegmentPrefix { key: key.clone() });
+                }
+                Some(n) => {
+                    touched_segments.insert(key.slice(0..n));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -431,12 +475,10 @@ impl WriteBatchIterator {
             .ops
             .range(range)
             .map(|(k, v)| {
-                let expire_ts = match v {
-                    WriteOp::Put(_, _, opts) => opts.expire_ts_from(default_ttl, now),
-                    WriteOp::Merge(_, _, opts) => opts.expire_ts_from(default_ttl, now),
-                    WriteOp::Delete(_) => None,
-                };
-                (k.clone(), v.to_row_entry(seq, Some(now), expire_ts))
+                (
+                    k.clone(),
+                    v.to_row_entry(seq, Some(now), v.expire_ts_from(default_ttl, now)),
+                )
             })
             .collect();
 
@@ -485,7 +527,7 @@ mod tests {
 
     use super::*;
     use crate::bytes_range::BytesRange;
-    use crate::config::Ttl;
+    use crate::config::{MemtableDedupe, Ttl};
     use crate::test_utils::assert_iterator;
     use crate::types::RowEntry;
 
@@ -1286,6 +1328,10 @@ mod tests {
         }
     }
 
+    fn rows_from_prepared(entries: Vec<PreparedWriteEntry>) -> Vec<RowEntry> {
+        entries.into_iter().map(|entry| entry.row).collect()
+    }
+
     #[tokio::test]
     async fn should_extract_entries_no_merges() {
         // Given: a WriteBatch with no merge operations
@@ -1296,9 +1342,10 @@ mod tests {
 
         // When: extracting entries
         let (result, _) = batch
-            .extract_entries(100, 1000, None, None, None)
+            .extract_prepared_entries(100, 1000, None, None, None)
             .await
             .unwrap();
+        let result = rows_from_prepared(result);
 
         // Then: should return entries for all operations without merging
         let mut entries = result.into_iter().collect::<Vec<_>>();
@@ -1320,13 +1367,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extract_prepared_entries_default_put_dedupe_disabled() {
+        let mut batch = WriteBatch::new();
+        batch.put(b"key1", b"value1");
+
+        let (result, _) = batch
+            .extract_prepared_entries(100, 1000, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].memtable_dedupe, MemtableDedupe::Disabled);
+    }
+
+    #[tokio::test]
+    async fn extract_prepared_entries_preserves_put_dedupe_option() {
+        let mut batch = WriteBatch::new();
+        batch.put_with_options(
+            b"key1",
+            b"value1",
+            &PutOptions {
+                memtable_dedupe: MemtableDedupe::DedupOldVersion,
+                ..Default::default()
+            },
+        );
+
+        let (result, _) = batch
+            .extract_prepared_entries(100, 1000, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].memtable_dedupe, MemtableDedupe::DedupOldVersion);
+    }
+
+    #[tokio::test]
+    async fn extract_prepared_entries_disables_delete_and_merge_dedupe() {
+        let mut batch = WriteBatch::new();
+        batch.delete(b"key1");
+        batch.merge(b"key2", b"merge1");
+
+        let merge_operator = Some(std::sync::Arc::new(StringConcatMergeOperator)
+            as crate::merge_operator::MergeOperatorType);
+        let (result, _) = batch
+            .extract_prepared_entries(100, 1000, None, merge_operator, None)
+            .await
+            .unwrap();
+
+        assert!(result
+            .iter()
+            .all(|entry| entry.memtable_dedupe == MemtableDedupe::Disabled));
+    }
+
+    #[tokio::test]
+    async fn extract_prepared_entries_disables_dedupe_after_merge_folding() {
+        let mut batch = WriteBatch::new();
+        batch.put_with_options(
+            b"key1",
+            b"value",
+            &PutOptions {
+                memtable_dedupe: MemtableDedupe::DedupOldVersion,
+                ..Default::default()
+            },
+        );
+        batch.merge(b"key1", b"merge1");
+
+        let merge_operator = Some(std::sync::Arc::new(StringConcatMergeOperator)
+            as crate::merge_operator::MergeOperatorType);
+        let (result, _) = batch
+            .extract_prepared_entries(100, 1000, None, merge_operator, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].memtable_dedupe, MemtableDedupe::Disabled);
+    }
+
+    #[tokio::test]
     async fn should_error_extracting_entries_with_merges_without_merge_operator() {
         let mut batch = WriteBatch::new();
         batch.put(b"key1", b"value1");
         batch.merge(b"key2", b"merge1");
 
         let err = batch
-            .extract_entries(100, 1000, None, None, None)
+            .extract_prepared_entries(100, 1000, None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, SlateDBError::MergeOperatorMissing));
@@ -1344,9 +1468,10 @@ mod tests {
         let merge_operator = Some(std::sync::Arc::new(StringConcatMergeOperator)
             as crate::merge_operator::MergeOperatorType);
         let (result, _) = batch
-            .extract_entries(100, 1000, None, merge_operator, None)
+            .extract_prepared_entries(100, 1000, None, merge_operator, None)
             .await
             .unwrap();
+        let result = rows_from_prepared(result);
 
         // Then: should return merged entry
         assert_eq!(result.len(), 1);
@@ -1369,9 +1494,10 @@ mod tests {
         let merge_operator = Some(std::sync::Arc::new(StringConcatMergeOperator)
             as crate::merge_operator::MergeOperatorType);
         let (result, _) = batch
-            .extract_entries(100, 1000, None, merge_operator, None)
+            .extract_prepared_entries(100, 1000, None, merge_operator, None)
             .await
             .unwrap();
+        let result = rows_from_prepared(result);
 
         // Then: should return merged entry (delete gets merged with merges)
         assert_eq!(result.len(), 1);
@@ -1395,9 +1521,10 @@ mod tests {
         let merge_operator = Some(std::sync::Arc::new(StringConcatMergeOperator)
             as crate::merge_operator::MergeOperatorType);
         let (result, _) = batch
-            .extract_entries(100, 1000, None, merge_operator, None)
+            .extract_prepared_entries(100, 1000, None, merge_operator, None)
             .await
             .unwrap();
+        let result = rows_from_prepared(result);
 
         // Then: should return merged entry
         assert_eq!(result.len(), 1);
